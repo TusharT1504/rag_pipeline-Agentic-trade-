@@ -119,20 +119,18 @@ def run_query(query: str, top_k: int | None = None) -> dict:
         final_answer = raw.final_answer
         tool_analysis = raw.tool_analysis
 
-    if error:
-        logger.error("Graph error: %s", error)
-        return {
-            "answer": f"An error occurred: {error}",
-            "sources": [],
-            "confidence": "low",
-            "tool_analysis": tool_analysis,
-        }
-
-    result = final_answer or {
+    default_result = {
         "answer": "The information is not available in the provided documents.",
         "sources": [],
         "confidence": "low",
     }
+
+    if error:
+        logger.error("Graph error: %s", error)
+        result = default_result.copy()
+        result["answer"] = f"An error occurred: {error}"
+    else:
+        result = final_answer or default_result
     result["tool_analysis"] = tool_analysis
     return result
 

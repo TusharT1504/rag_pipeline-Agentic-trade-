@@ -43,7 +43,6 @@ def _batched(lst: list, size: int) -> Iterator[list]:
     name="Embed Chunks - Google",
     metadata={
         "provider": "google",
-        "ls_provider": "google_genai",
         "ls_model_name": settings.EMBEDDING_MODEL,
     },
     process_inputs=compact_embedding_inputs,

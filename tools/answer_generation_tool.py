@@ -14,32 +14,10 @@ from observability import compact_search_outputs, traceable
 
 logger = logging.getLogger(__name__)
 
-# ── Provider-specific client helpers ────────────────────────────────────────
+# ── Constants ────────────────────────────────────────────────────────────────
 
 _CONFIDENCE_VALUES = {"high", "medium", "low"}
-
-_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "additionalProperties": False,
-    "required": ["answer", "sources", "confidence"],
-    "properties": {
-        "answer": {"type": "string"},
-        "sources": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "additionalProperties": False,
-                "required": ["document_name", "page_number", "section"],
-                "properties": {
-                    "document_name": {"type": "string"},
-                    "page_number": {"type": "integer"},
-                    "section": {"type": "string"},
-                },
-            },
-        },
-        "confidence": {"type": "string", "enum": sorted(_CONFIDENCE_VALUES)},
-    },
-}
+_DEFAULT_ANSWER = "The information is not available in the provided documents."
 
 
 def _google_response_schema(gtypes: Any) -> Any:
@@ -75,14 +53,14 @@ def _parse_json_string(raw: str) -> dict[str, Any]:
         parsed = json.loads(raw)
     except json.JSONDecodeError:
         logger.error("LLM returned invalid JSON: %s", raw[:200])
-        return {"answer": raw, "sources": [], "confidence": "low"}
+        return {"answer": _DEFAULT_ANSWER, "sources": [], "confidence": "low"}
 
     if isinstance(parsed, dict):
         return parsed
 
     logger.error("LLM returned non-object JSON payload: %s", type(parsed).__name__)
     return {
-        "answer": "The information is not available in the provided documents.",
+        "answer": _DEFAULT_ANSWER,
         "sources": [],
         "confidence": "low",
     }
@@ -90,11 +68,8 @@ def _parse_json_string(raw: str) -> dict[str, Any]:
 
 def _normalize_result(result: dict[str, Any]) -> dict[str, Any]:
     """Guarantee required output keys and expected value types."""
-    answer = result.get("answer")
-    if not isinstance(answer, str) or not answer.strip():
-        answer = "The information is not available in the provided documents."
-    else:
-        answer = answer.strip()
+    answer = result.get("answer", "")
+    answer = (answer if isinstance(answer, str) else "").strip() or _DEFAULT_ANSWER
 
     sources: list[dict[str, Any]] = []
     raw_sources = result.get("sources", [])
@@ -102,16 +77,10 @@ def _normalize_result(result: dict[str, Any]) -> dict[str, Any]:
         for src in raw_sources:
             if not isinstance(src, dict):
                 continue
-            document_name = src.get("document_name")
-            section = src.get("section")
-            page_number = src.get("page_number")
-
-            if not isinstance(document_name, str) or not document_name.strip():
-                document_name = "unknown"
-            if not isinstance(section, str) or not section.strip():
-                section = "General"
+            document_name = (src.get("document_name") or "").strip() or "unknown"
+            section = (src.get("section") or "").strip() or "General"
             try:
-                page_number = int(page_number)
+                page_number = int(src.get("page_number", 0))
             except (TypeError, ValueError):
                 page_number = 0
 
@@ -142,21 +111,23 @@ def _compact_answer_inputs(inputs: dict[str, Any]) -> dict[str, Any]:
 def _compact_answer_outputs(output: Any) -> dict[str, Any]:
     result = output if isinstance(output, dict) else {}
     answer = result.get("answer", "")
+    sources = result.get("sources", [])
     return {
         "answer_preview": answer[:300] if isinstance(answer, str) else "",
-        "source_count": len(result.get("sources", [])) if isinstance(result.get("sources"), list) else 0,
+        "source_count": len(sources) if isinstance(sources, list) else 0,
         "confidence": result.get("confidence"),
     }
 
 
 def _compact_llm_inputs(inputs: dict[str, Any]) -> dict[str, Any]:
-    system_prompt = inputs.get("system_prompt", "")
-    user_message = inputs.get("user_message", "")
+    def _safe_len(val: Any) -> int:
+        return len(val) if isinstance(val, str) else 0
+    
     return {
         "provider": settings.LLM_PROVIDER,
         "model": settings.LLM_MODEL,
-        "system_prompt_chars": len(system_prompt) if isinstance(system_prompt, str) else 0,
-        "user_message_chars": len(user_message) if isinstance(user_message, str) else 0,
+        "system_prompt_chars": _safe_len(inputs.get("system_prompt", "")),
+        "user_message_chars": _safe_len(inputs.get("user_message", "")),
     }
 
 
@@ -165,7 +136,6 @@ def _compact_llm_inputs(inputs: dict[str, Any]) -> dict[str, Any]:
     name="Generate Answer LLM",
     metadata={
         "provider": settings.LLM_PROVIDER,
-        "ls_provider": settings.LLM_PROVIDER,
         "ls_model_name": settings.LLM_MODEL,
     },
     process_inputs=_compact_llm_inputs,
@@ -191,13 +161,9 @@ def _call_llm(system_prompt: str, user_message: str) -> dict[str, Any]:
         )
         parsed = getattr(response, "parsed", None)
         if parsed is not None:
-            if hasattr(parsed, "model_dump"):
-                parsed = parsed.model_dump()
-            elif hasattr(parsed, "dict"):
-                parsed = parsed.dict()
-
-            if isinstance(parsed, dict):
-                return parsed
+            converted = getattr(parsed, "model_dump", lambda: getattr(parsed, "dict", lambda: None))()
+            if isinstance(converted, dict):
+                return converted
 
         return _parse_json_string(response.text or "{}")
 
@@ -262,7 +228,7 @@ def answer_generation_tool(query: str, retrieved_chunks: list[dict]) -> dict:
     """
     if not retrieved_chunks:
         return {
-            "answer": "The information is not available in the provided documents.",
+            "answer": _DEFAULT_ANSWER,
             "sources": [],
             "confidence": "low",
         }

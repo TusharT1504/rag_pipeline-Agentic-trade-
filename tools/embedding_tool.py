@@ -88,7 +88,6 @@ def _embed_sentence_transformers(chunks: list[dict], batch_size: int = 64) -> li
     name="Embed Chunks",
     metadata={
         "provider": settings.EMBEDDING_PROVIDER,
-        "ls_provider": settings.EMBEDDING_PROVIDER,
         "ls_model_name": settings.EMBEDDING_MODEL,
     },
     process_inputs=compact_embedding_inputs,

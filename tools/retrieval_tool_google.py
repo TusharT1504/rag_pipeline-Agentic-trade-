@@ -13,6 +13,7 @@ from google.genai import types
 from config import settings
 from observability import retrieved_chunks_as_documents, traceable
 from tools.vector_store_tool import similarity_search
+from tools.retrieval_tool import _apply_keyword_reranking
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +32,6 @@ def _get_client() -> genai.Client:
     name="Retrieve Chunks - Google",
     metadata={
         "provider": "google",
-        "ls_provider": "google_genai",
         "ls_model_name": settings.EMBEDDING_MODEL,
     },
     process_outputs=retrieved_chunks_as_documents,
@@ -50,27 +50,19 @@ def retrieval_tool(query: str, top_k: int | None = None) -> list[dict]:
     list[dict]  —  [{"text": str, "score": float, "metadata": dict}, ...]
     """
     client = _get_client()
-    model = settings.EMBEDDING_MODEL   # "gemini-embedding-004"
+    model = settings.EMBEDDING_MODEL  # "gemini-embedding-004"
 
     logger.info("Google-embedding query: '%s'", query[:80])
     result = client.models.embed_content(
         model=model,
         contents=query,
         config=types.EmbedContentConfig(
-            task_type="RETRIEVAL_QUERY",   # ← must differ from document task_type
+            task_type="RETRIEVAL_QUERY",  # ← must differ from document task_type
         ),
     )
     query_embedding: list[float] = result.embeddings[0].values
 
     chunks = similarity_search(query_embedding, top_k=top_k)
-
-    # lightweight keyword re-ranking
-    keywords = set(query.lower().split())
-    for chunk in chunks:
-        overlap = sum(1 for kw in keywords if kw in chunk["text"].lower())
-        chunk["score"] = round(chunk["score"] + overlap * 0.005, 4)
-        chunk["page_content"] = chunk["text"]
-        chunk["type"] = "Document"
-
+    _apply_keyword_reranking(chunks, query)
     chunks.sort(key=lambda c: c["score"], reverse=True)
     return chunks

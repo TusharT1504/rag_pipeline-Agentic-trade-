@@ -5,7 +5,6 @@ Loads every PDF from the configured directory and returns a list of
 """
 
 from __future__ import annotations
-import os
 import logging
 from pathlib import Path
 
@@ -48,7 +47,7 @@ def pdf_loader_tool() -> list[dict]:
                 text = page.extract_text() or ""
                 text = text.strip()
                 if not text:
-                    continue          # skip empty/scanned pages
+                    continue  # skip empty/scanned pages
                 pages.append(
                     {
                         "document_name": pdf_path.name,

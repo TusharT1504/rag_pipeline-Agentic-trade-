@@ -30,7 +30,6 @@ logger = logging.getLogger(__name__)
     name="Embed Chunks - SentenceTransformers",
     metadata={
         "provider": "sentence_transformers",
-        "ls_provider": "sentence_transformers",
         "ls_model_name": settings.EMBEDDING_MODEL,
     },
     process_inputs=compact_embedding_inputs,

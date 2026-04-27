@@ -17,6 +17,17 @@ from tools.vector_store_tool import similarity_search
 
 logger = logging.getLogger(__name__)
 
+
+def _apply_keyword_reranking(chunks: list[dict], query: str) -> None:
+    """Boost scores based on keyword overlap and add LangSmith fields."""
+    keywords = set(query.lower().split())
+    for chunk in chunks:
+        overlap = sum(1 for kw in keywords if kw in chunk["text"].lower())
+        chunk["score"] = round(chunk["score"] + overlap * 0.005, 4)
+        chunk["page_content"] = chunk["text"]
+        chunk["type"] = "Document"
+
+
 # ── Provider implementations ─────────────────────────────────────────────────
 
 def _query_embed_google(query: str) -> list[float]:
@@ -44,7 +55,6 @@ def _query_embed_sentence_transformers(query: str) -> list[float]:
     name="Retrieve Chunks",
     metadata={
         "provider": settings.EMBEDDING_PROVIDER,
-        "ls_provider": settings.EMBEDDING_PROVIDER,
         "ls_model_name": settings.EMBEDDING_MODEL,
     },
     process_outputs=retrieved_chunks_as_documents,
@@ -78,14 +88,6 @@ def retrieval_tool(query: str, top_k: int | None = None) -> list[dict]:
         )
 
     chunks = similarity_search(query_embedding, top_k=top_k)
-
-    # Lightweight keyword re-ranking boost
-    keywords = set(query.lower().split())
-    for chunk in chunks:
-        overlap = sum(1 for kw in keywords if kw in chunk["text"].lower())
-        chunk["score"] = round(chunk["score"] + overlap * 0.005, 4)
-        chunk["page_content"] = chunk["text"]
-        chunk["type"] = "Document"
-
+    _apply_keyword_reranking(chunks, query)
     chunks.sort(key=lambda c: c["score"], reverse=True)
     return chunks
