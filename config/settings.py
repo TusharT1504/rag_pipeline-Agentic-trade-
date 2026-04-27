@@ -16,6 +16,7 @@ def _env_bool(name: str, default: bool) -> bool:
 class Settings:
     # ── API Keys ────────────────────────────────────────────────────────────
     GOOGLE_API_KEY: str   = os.getenv("GOOGLE_API_KEY", "")
+    GROQ_API_KEY: str     = os.getenv("GROQ_API_KEY", "")
     PINECONE_API_KEY: str  = os.getenv("PINECONE_API_KEY", "")
     PINECONE_ENVIRONMENT: str = os.getenv("PINECONE_ENVIRONMENT", "us-east-1")
     PINECONE_INDEX_NAME: str  = os.getenv("PINECONE_INDEX_NAME", "rag-documents")
@@ -48,7 +49,7 @@ class Settings:
     EMBEDDING_DIMENSION: int = int(os.getenv("EMBEDDING_DIMENSION", 768))
 
     # ── LLM ─────────────────────────────────────────────────────────────────
-    LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "google")   # "google"
+    LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "google")   # "google" | "groq"
     LLM_MODEL: str    = os.getenv("LLM_MODEL", "gemini-2.5-flash")
 
     # ── LangSmith tracing ──────────────────────────────────────────────────

@@ -167,8 +167,25 @@ def _call_llm(system_prompt: str, user_message: str) -> dict[str, Any]:
 
         return _parse_json_string(response.text or "{}")
 
+    elif provider == "groq":
+        from langchain_groq import ChatGroq
+
+        llm = ChatGroq(
+            model="llama-3.3-70b-versatile",
+            api_key=settings.GROQ_API_KEY,
+            temperature=0.3,
+        )
+
+        messages = [
+            ("system", system_prompt),
+            ("human", user_message),
+        ]
+
+        response = llm.invoke(messages)
+        return _parse_json_string(response.content or "{}")
+
     else:
-        raise ValueError(f"Unknown LLM_PROVIDER: '{provider}'. Use 'google'")
+        raise ValueError(f"Unknown LLM_PROVIDER: '{provider}'. Use 'google' or 'groq'")
 
 
 _SYSTEM_PROMPT = """\

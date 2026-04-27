@@ -13,6 +13,9 @@ google-genai>=0.8.0
 # ── Sentence Transformers (local, free embedding) ──────────────────────────
 sentence-transformers>=3.0.0
 
+# ── Groq (LLM provider) ────────────────────────────────────────────────────
+langchain-groq>=0.1.0
+
 # ── OpenAI (optional, only if EMBEDDING_PROVIDER=openai or LLM_PROVIDER=openai) ──
 # openai>=1.30.0
 # tiktoken>=0.7.0
