@@ -1,0 +1,22 @@
+langgraph>=0.2.0
+langchain>=0.2.0
+langchain-community>=0.2.0
+langsmith>=0.1.98
+pinecone>=5.0.0
+pypdf>=4.0.0
+python-dotenv>=1.0.0
+pydantic>=2.0.0
+
+# ── Google (free LLM + embedding) ──────────────────────────────────────────
+google-genai>=0.8.0
+
+# ── Sentence Transformers (local, free embedding) ──────────────────────────
+sentence-transformers>=3.0.0
+
+# ── OpenAI (optional, only if EMBEDDING_PROVIDER=openai or LLM_PROVIDER=openai) ──
+# openai>=1.30.0
+# tiktoken>=0.7.0
+
+# ── API server (optional) ──────────────────────────────────────────────────
+# fastapi>=0.111.0
+# uvicorn>=0.30.0
