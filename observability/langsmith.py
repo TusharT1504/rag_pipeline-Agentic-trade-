@@ -1,164 +1,247 @@
-"""LangSmith tracing utilities.
-
-The project should still run before dependencies are installed or when tracing
-is disabled, so this module degrades to no-op decorators if LangSmith is absent.
+"""
+LangSmith observability and tracing utilities.
+Wraps every node call with structured logging of inputs, outputs,
+execution time, and domain metadata.
 """
 
-from __future__ import annotations
-
+import time
 import logging
-from collections import Counter
-from typing import Any, Callable
+import functools
+from dataclasses import fields, is_dataclass
+from typing import Any, Callable, TypeVar
+from datetime import datetime, timezone
+
+from langsmith import Client
+from langsmith.run_helpers import traceable
+
+from config.settings import get_settings
 
 logger = logging.getLogger(__name__)
+settings = get_settings()
 
-try:
-    from langsmith import get_current_run_tree, traceable
-except ImportError:  # pragma: no cover - exercised only without optional deps
-    get_current_run_tree = None
+# ── LangSmith client (lazy) ──────────────────────────────────────────────────
 
-    def traceable(*args: Any, **kwargs: Any) -> Callable:
-        """No-op replacement with the same decorator ergonomics."""
-        if args and callable(args[0]) and len(args) == 1 and not kwargs:
-            return args[0]
-
-        def decorator(func: Callable) -> Callable:
-            return func
-
-        return decorator
+_ls_client: Client | None = None
 
 
-def _text_preview(value: str, limit: int = 180) -> str:
-    return value.replace("\n", " ").strip()[:limit]
-
-
-def _get_sequence(inputs: dict[str, Any], key: str) -> list[Any]:
-    value = inputs.get(key)
-    return value if isinstance(value, list) else []
-
-
-def add_current_run_metadata(metadata: dict[str, Any]) -> None:
-    """Attach diagnostic metadata to the active LangSmith span if one exists."""
-    if get_current_run_tree is None:
-        return
-
+def get_langsmith_client() -> Client | None:
+    """Return a cached LangSmith client, or None if not configured."""
+    global _ls_client
+    if _ls_client is not None:
+        return _ls_client
+    if not settings.langchain_api_key or not settings.langchain_tracing_v2:
+        logger.warning("LANGCHAIN_API_KEY not set — LangSmith tracing disabled.")
+        return None
     try:
-        run_tree = get_current_run_tree()
-        if run_tree is None:
-            return
-        run_tree.metadata.update(metadata)
-    except Exception as exc:  # pragma: no cover - tracing must not break RAG
-        logger.debug("Could not update LangSmith run metadata: %s", exc)
-
-
-def compact_pages_inputs(inputs: dict[str, Any]) -> dict[str, Any]:
-    pages = _get_sequence(inputs, "pages")
-    return {
-        "page_count": len(pages),
-        "documents": sorted(
-            {page.get("document_name", "unknown") for page in pages if isinstance(page, dict)}
-        )[:20],
-    }
-
-
-def compact_pages_outputs(output: Any) -> dict[str, Any]:
-    pages = output if isinstance(output, list) else []
-    document_counts = Counter(
-        page.get("document_name", "unknown")
-        for page in pages
-        if isinstance(page, dict)
-    )
-    return {
-        "page_count": len(pages),
-        "document_count": len(document_counts),
-        "documents": dict(document_counts.most_common(20)),
-    }
-
-
-def compact_embedding_inputs(inputs: dict[str, Any]) -> dict[str, Any]:
-    chunks = _get_sequence(inputs, "chunks")
-    return {
-        "chunk_count": len(chunks),
-        "sample_chunk_ids": [
-            chunk.get("id")
-            for chunk in chunks[:5]
-            if isinstance(chunk, dict) and chunk.get("id")
-        ],
-        "sample_text": [
-            _text_preview(chunk.get("text", ""))
-            for chunk in chunks[:3]
-            if isinstance(chunk, dict)
-        ],
-    }
-
-
-def compact_embedding_outputs(output: Any) -> dict[str, Any]:
-    chunks = output if isinstance(output, list) else []
-    first_embedding = None
-    for chunk in chunks:
-        if isinstance(chunk, dict):
-            first_embedding = chunk.get("embedding")
-            if first_embedding is not None:
-                break
-
-    return {
-        "chunk_count": len(chunks),
-        "embedding_dimension": len(first_embedding) if isinstance(first_embedding, list) else None,
-        "sample_chunk_ids": [
-            chunk.get("id")
-            for chunk in chunks[:5]
-            if isinstance(chunk, dict) and chunk.get("id")
-        ],
-    }
-
-
-def compact_search_inputs(inputs: dict[str, Any]) -> dict[str, Any]:
-    embedding = inputs.get("query_embedding")
-    return {
-        "query_embedding_dimension": len(embedding) if isinstance(embedding, list) else None,
-        "top_k": inputs.get("top_k"),
-    }
-
-
-def compact_search_outputs(output: Any) -> dict[str, Any]:
-    chunks = output if isinstance(output, list) else []
-    scores = [
-        float(chunk.get("score", 0.0))
-        for chunk in chunks
-        if isinstance(chunk, dict)
-    ]
-    return {
-        "result_count": len(chunks),
-        "top_score": max(scores) if scores else None,
-        "lowest_score": min(scores) if scores else None,
-        "sources": [
-            {
-                "document_name": chunk.get("metadata", {}).get("document_name", "unknown"),
-                "page_number": chunk.get("metadata", {}).get("page_number"),
-                "score": chunk.get("score"),
-            }
-            for chunk in chunks[:10]
-            if isinstance(chunk, dict)
-        ],
-    }
-
-
-def retrieved_chunks_as_documents(output: Any) -> list[dict[str, Any]]:
-    """Format retrieved chunks for LangSmith's retriever UI."""
-    chunks = output if isinstance(output, list) else []
-    documents: list[dict[str, Any]] = []
-    for chunk in chunks:
-        if not isinstance(chunk, dict):
-            continue
-
-        metadata = dict(chunk.get("metadata", {}))
-        metadata["score"] = chunk.get("score")
-        documents.append(
-            {
-                "page_content": chunk.get("text", ""),
-                "type": "Document",
-                "metadata": metadata,
-            }
+        _ls_client = Client(
+            api_url=settings.langchain_endpoint,
+            api_key=settings.langchain_api_key,
         )
+        logger.info("LangSmith client initialised (project=%s)", settings.langchain_project)
+    except Exception as exc:
+        logger.error("Failed to create LangSmith client: %s", exc)
+        _ls_client = None
+    return _ls_client
 
-    return documents
+
+# ── Trace decorator ──────────────────────────────────────────────────────────
+
+F = TypeVar("F", bound=Callable[..., Any])
+
+
+def _tracing_enabled() -> bool:
+    return bool(settings.langchain_api_key and settings.langchain_tracing_v2)
+
+
+def _compact_value(value: Any) -> Any:
+    """Return a LangSmith-friendly summary without large vectors or full documents."""
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        if len(value) <= 300:
+            return value
+        return {"type": "str", "chars": len(value), "preview": value[:300]}
+    if isinstance(value, dict):
+        return {
+            str(k): _compact_value(v)
+            for k, v in list(value.items())[:20]
+            if str(k).lower() not in {"values", "embedding", "vector", "query_vector"}
+        }
+    if isinstance(value, (list, tuple)):
+        if value and all(isinstance(item, (int, float)) for item in value):
+            return {"type": "vector", "dimension": len(value)}
+        if value and all(
+            isinstance(item, (list, tuple))
+            and all(isinstance(v, (int, float)) for v in item)
+            for item in value[:5]
+        ):
+            first = value[0] if value else []
+            return {"type": "vector_batch", "count": len(value), "dimension": len(first)}
+        return {
+            "type": type(value).__name__,
+            "count": len(value),
+            "sample": [_compact_value(item) for item in list(value)[:3]],
+        }
+    if is_dataclass(value):
+        summary: dict[str, Any] = {"type": type(value).__name__}
+        for field in fields(value):
+            if field.name in {"text", "query_embedding", "chunk_embeddings"}:
+                field_value = getattr(value, field.name)
+                summary[field.name] = _compact_value(field_value)
+            elif field.name in {
+                "chunk_id",
+                "sector",
+                "source_file",
+                "page_number",
+                "namespace",
+                "score",
+                "query",
+                "namespaces",
+                "top_k",
+                "error",
+                "mode",
+                "upserted_count",
+            }:
+                summary[field.name] = _compact_value(getattr(value, field.name))
+        return summary
+    return {"type": type(value).__name__, "repr": repr(value)[:300]}
+
+
+def _compact_trace_inputs(inputs: dict[str, Any]) -> dict[str, Any]:
+    return {key: _compact_value(value) for key, value in inputs.items()}
+
+
+def _compact_trace_outputs(output: Any) -> Any:
+    return _compact_value(output)
+
+
+def traced_function(
+    run_name: str,
+    run_type: str = "chain",
+    metadata: dict[str, Any] | None = None,
+) -> Callable[[F], F]:
+    """Trace a regular helper/function with compact LangSmith payloads."""
+    extra_meta = metadata or {}
+
+    def decorator(fn: F) -> F:
+        if _tracing_enabled():
+            return traceable(
+                name=run_name,
+                run_type=run_type,
+                metadata={
+                    "project": settings.langchain_project,
+                    **extra_meta,
+                },
+                process_inputs=_compact_trace_inputs,
+                process_outputs=_compact_trace_outputs,
+            )(fn)  # type: ignore[return-value]
+        return fn
+
+    return decorator
+
+
+def traced_tool(run_name: str, metadata: dict[str, Any] | None = None) -> Callable[[F], F]:
+    """Trace a pipeline tool function as a LangSmith tool run."""
+    tool_metadata = {"component": "tool", **(metadata or {})}
+    return traced_function(run_name, run_type="tool", metadata=tool_metadata)
+
+
+def traced_node(run_name: str, metadata: dict[str, Any] | None = None) -> Callable[[F], F]:
+    """
+    Decorator that wraps an async or sync node function with:
+    - LangSmith tracing via @traceable
+    - Structured logging of inputs, outputs, and wall-clock time
+    - Custom metadata attached to the run
+
+    Usage::
+
+        @traced_node("retrieval_node", metadata={"stage": "retrieval"})
+        async def retrieval_node(state: RAGState) -> RAGState:
+            ...
+    """
+    extra_meta = metadata or {}
+
+    def decorator(fn: F) -> F:
+        # Apply LangSmith @traceable only when tracing is actually configured.
+        if _tracing_enabled():
+            traced_fn = traceable(
+                name=run_name,
+                run_type="chain",
+                metadata={
+                    "project": settings.langchain_project,
+                    "node": run_name,
+                    **extra_meta,
+                },
+                process_inputs=_compact_trace_inputs,
+                process_outputs=_compact_trace_outputs,
+            )(fn)
+        else:
+            traced_fn = fn
+
+        @functools.wraps(fn)
+        async def async_wrapper(*args, **kwargs):
+            start = time.perf_counter()
+            logger.info(
+                "[%s] START | args_keys=%s kwargs_keys=%s",
+                run_name,
+                [type(a).__name__ for a in args],
+                list(kwargs.keys()),
+            )
+            try:
+                result = await traced_fn(*args, **kwargs)
+                elapsed = time.perf_counter() - start
+                logger.info("[%s] END | elapsed=%.3fs", run_name, elapsed)
+                return result
+            except Exception as exc:
+                elapsed = time.perf_counter() - start
+                logger.error("[%s] ERROR after %.3fs | %s", run_name, elapsed, exc)
+                raise
+
+        @functools.wraps(fn)
+        def sync_wrapper(*args, **kwargs):
+            start = time.perf_counter()
+            logger.info("[%s] START", run_name)
+            try:
+                result = traced_fn(*args, **kwargs)
+                elapsed = time.perf_counter() - start
+                logger.info("[%s] END | elapsed=%.3fs", run_name, elapsed)
+                return result
+            except Exception as exc:
+                elapsed = time.perf_counter() - start
+                logger.error("[%s] ERROR after %.3fs | %s", run_name, elapsed, exc)
+                raise
+
+        import asyncio
+
+        if asyncio.iscoroutinefunction(fn):
+            return async_wrapper  # type: ignore[return-value]
+        return sync_wrapper  # type: ignore[return-value]
+
+    return decorator
+
+
+def log_node_metadata(
+    run_name: str,
+    query: str | None = None,
+    namespace: str | list[str] | None = None,
+    retrieved_docs_count: int | None = None,
+    extra: dict[str, Any] | None = None,
+) -> None:
+    """
+    Emit a structured log line with node-level metadata.
+    Call this INSIDE a node after results are available.
+    """
+    payload: dict[str, Any] = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "node": run_name,
+    }
+    if query is not None:
+        payload["query"] = query[:200]  # truncate for log brevity
+    if namespace is not None:
+        payload["namespace"] = namespace
+    if retrieved_docs_count is not None:
+        payload["retrieved_docs_count"] = retrieved_docs_count
+    if extra:
+        payload.update(extra)
+
+    logger.info("[%s] METADATA | %s", run_name, payload)

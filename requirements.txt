@@ -6,6 +6,7 @@ pinecone>=5.0.0
 pypdf>=4.0.0
 python-dotenv>=1.0.0
 pydantic>=2.0.0
+pydantic-settings>=2.0.0
 
 # ── Google (free LLM + embedding) ──────────────────────────────────────────
 google-genai>=0.8.0

@@ -1,64 +1,130 @@
-"""Analysis helpers for retrieved tool results."""
+"""
+Tool Analysis Utility.
+Provides helpers to inspect and summarise the outputs of pipeline tools,
+useful for debugging, observability dashboards, and test assertions.
+"""
 
 from __future__ import annotations
 
+import logging
 from collections import Counter
-from statistics import mean
 from typing import Any
 
-from config import settings
-from observability import add_current_run_metadata, traceable
+from graph.state import DocumentChunk, RetrievedChunk
+from observability.langsmith import traced_function
+
+logger = logging.getLogger(__name__)
 
 
-def _round_score(value: float | None) -> float | None:
-    return round(value, 4) if value is not None else None
+# ── Ingestion analysis ────────────────────────────────────────────────────────
 
 
-@traceable(run_type="tool", name="Retrieval Tool Analysis")
-def tool_analysis_tool(query: str, retrieved_chunks: list[dict[str, Any]]) -> dict[str, Any]:
-    """Summarize retrieval quality and source coverage for a query."""
-    scores = [
-        float(chunk.get("score", 0.0))
-        for chunk in retrieved_chunks
-        if isinstance(chunk, dict)
-    ]
-    source_counts = Counter(
-        chunk.get("metadata", {}).get("document_name", "unknown")
-        for chunk in retrieved_chunks
-        if isinstance(chunk, dict)
-    )
+@traced_function("analyse_chunks", metadata={"component": "analysis"})
+def analyse_chunks(chunks: list[DocumentChunk]) -> dict[str, Any]:
+    """
+    Summarise a list of ``DocumentChunk`` objects.
 
-    analysis = {
-        "query": query,
-        "embedding_provider": settings.EMBEDDING_PROVIDER,
-        "embedding_model": settings.EMBEDDING_MODEL,
-        "top_k": settings.TOP_K,
-        "retrieved_count": len(retrieved_chunks),
-        "score_summary": {
-            "top": _round_score(max(scores) if scores else None),
-            "average": _round_score(mean(scores) if scores else None),
-            "lowest": _round_score(min(scores) if scores else None),
-        },
-        "source_coverage": dict(source_counts.most_common(10)),
-        "top_chunks": [
-            {
-                "rank": index,
-                "score": chunk.get("score"),
-                "document_name": chunk.get("metadata", {}).get("document_name", "unknown"),
-                "page_number": chunk.get("metadata", {}).get("page_number"),
-                "section": chunk.get("metadata", {}).get("section", "General"),
-            }
-            for index, chunk in enumerate(retrieved_chunks[:5], start=1)
-            if isinstance(chunk, dict)
-        ],
+    Returns a dict with:
+    - total_chunks
+    - chunks_per_source (Counter)
+    - chunks_per_page (Counter)
+    - avg_char_length
+    - min_char_length
+    - max_char_length
+    """
+    if not chunks:
+        return {"total_chunks": 0}
+
+    lengths = [len(c.text) for c in chunks]
+    per_source = Counter(c.source_file for c in chunks)
+    per_page = Counter(c.page_number for c in chunks)
+
+    summary = {
+        "total_chunks": len(chunks),
+        "chunks_per_source": dict(per_source),
+        "chunks_per_page": dict(per_page),
+        "avg_char_length": round(sum(lengths) / len(lengths), 1),
+        "min_char_length": min(lengths),
+        "max_char_length": max(lengths),
     }
+    logger.debug("Chunk analysis: %s", summary)
+    return summary
 
-    add_current_run_metadata(
-        {
-            "retrieved_count": analysis["retrieved_count"],
-            "retrieval_top_score": analysis["score_summary"]["top"],
-            "retrieval_average_score": analysis["score_summary"]["average"],
-            "retrieval_source_count": len(source_counts),
-        }
-    )
-    return analysis
+
+@traced_function("analyse_embeddings", metadata={"component": "analysis"})
+def analyse_embeddings(vectors: list[list[float]]) -> dict[str, Any]:
+    """
+    Basic statistics on a batch of embedding vectors.
+
+    Returns a dict with:
+    - count
+    - dimension
+    - all_same_dimension (bool)
+    """
+    if not vectors:
+        return {"count": 0}
+
+    dims = [len(v) for v in vectors]
+    summary = {
+        "count": len(vectors),
+        "dimension": dims[0] if dims else 0,
+        "all_same_dimension": len(set(dims)) == 1,
+    }
+    logger.debug("Embedding analysis: %s", summary)
+    return summary
+
+
+# ── Retrieval analysis ────────────────────────────────────────────────────────
+
+
+@traced_function("analyse_retrieved_chunks", metadata={"component": "analysis"})
+def analyse_retrieved_chunks(chunks: list[RetrievedChunk]) -> dict[str, Any]:
+    """
+    Summarise Pinecone retrieval results.
+
+    Returns a dict with:
+    - total_retrieved
+    - namespaces_hit (list)
+    - score_stats (min, max, avg)
+    - sources (list of unique source files)
+    """
+    if not chunks:
+        return {"total_retrieved": 0, "namespaces_hit": [], "sources": []}
+
+    scores = [c.score for c in chunks]
+    summary = {
+        "total_retrieved": len(chunks),
+        "namespaces_hit": list({c.namespace for c in chunks}),
+        "score_stats": {
+            "min": round(min(scores), 4),
+            "max": round(max(scores), 4),
+            "avg": round(sum(scores) / len(scores), 4),
+        },
+        "sources": list({c.source_file for c in chunks}),
+    }
+    logger.debug("Retrieval analysis: %s", summary)
+    return summary
+
+
+@traced_function("format_context_for_display", metadata={"component": "analysis"})
+def format_context_for_display(chunks: list[RetrievedChunk], max_chars: int = 200) -> str:
+    """
+    Return a human-readable summary of retrieved chunks, e.g. for logging.
+
+    Args:
+        chunks: Retrieved chunks.
+        max_chars: Maximum characters of chunk text to display per entry.
+
+    Returns:
+        Multi-line string.
+    """
+    lines = [f"Retrieved {len(chunks)} chunk(s):"]
+    for i, c in enumerate(chunks, 1):
+        preview = c.text[:max_chars].replace("\n", " ")
+        if len(c.text) > max_chars:
+            preview += "…"
+        lines.append(
+            f"  [{i}] ns={c.namespace} | src={c.source_file}:p{c.page_number}"
+            f" | score={c.score:.4f}\n      {preview}"
+        )
+    return "\n".join(lines)

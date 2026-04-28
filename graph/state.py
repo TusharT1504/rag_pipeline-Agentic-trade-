@@ -1,42 +1,106 @@
-"""graph/state.py — LangGraph shared state schema"""
+"""
+Typed state definition for the RAG LangGraph.
+A single RAGState dataclass flows through every node; each node
+mutates only the fields it owns and returns the updated state.
+"""
 
 from __future__ import annotations
-from typing import Any, Optional
-from pydantic import BaseModel, Field
+
+from dataclasses import dataclass, field
+from typing import Any
 
 
-class RAGState(BaseModel):
+@dataclass
+class DocumentChunk:
+    """Represents a single chunk of text derived from a source document."""
+
+    chunk_id: str
+    text: str
+    sector: str
+    source_file: str
+    page_number: int
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class RetrievedChunk:
+    """A chunk returned from Pinecone retrieval with a similarity score."""
+
+    chunk_id: str
+    text: str
+    score: float
+    sector: str
+    source_file: str
+    page_number: int
+    namespace: str
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class RAGState:
     """
-    Shared mutable state that flows through every node in the LangGraph.
-    Each node reads what it needs and writes its outputs back here.
+    Shared mutable state that flows through every LangGraph node.
+
+    Ingestion fields are populated only in ingestion mode.
+    Retrieval fields are populated only in retrieval mode.
+    Both modes share the ``error`` and ``mode`` fields.
     """
 
-    # ── Input ──────────────────────────────────────────────────────────────
+    # ── Mode control ─────────────────────────────────────────────────────────
+    ingest_flag: bool = False
+    """If True the graph runs the ingestion pipeline; else retrieval."""
+
+    mode: str = "retrieval"
+    """Human-readable mode label – 'retrieval' or 'ingestion'."""
+
+    # ── Query / retrieval fields ──────────────────────────────────────────────
     query: str = ""
+    """The user's natural-language question."""
 
-    # ── Embedding pipeline ─────────────────────────────────────────────────
-    embeddings_exist: Optional[bool] = None      # None = not yet checked
-    raw_texts: list[dict[str, Any]] = Field(default_factory=list)
-    # Each item: {"document_name": str, "page_number": int, "text": str}
+    namespaces: list[str] = field(default_factory=list)
+    """Pinecone namespaces to query (e.g. ['ESDM', 'cement'])."""
 
-    chunks: list[dict[str, Any]] = Field(default_factory=list)
-    # Each item: {"id": str, "text": str, "metadata": dict}
+    top_k: int = 5
+    """Number of nearest-neighbour chunks to retrieve."""
 
-    vectors_stored: bool = False
+    query_embedding: list[float] = field(default_factory=list)
+    """Dense vector representation of the query (populated by embedding node)."""
 
-    # ── Retrieval ──────────────────────────────────────────────────────────
-    retrieved_chunks: list[dict[str, Any]] = Field(default_factory=list)
-    # Each item: {"text": str, "score": float, "metadata": dict}
+    retrieved_chunks: list[RetrievedChunk] = field(default_factory=list)
+    """Chunks retrieved from Pinecone (populated by retrieval node)."""
 
-    # ── Answer generation ──────────────────────────────────────────────────
-    tool_analysis: dict[str, Any] = Field(default_factory=dict)
-    # Retrieval diagnostics for tracing/debugging.
+    answer: str = ""
+    """Final generated answer (populated by answer-generation node)."""
 
-    final_answer: Optional[dict[str, Any]] = None
-    # Shape: {"answer": str, "sources": [...], "confidence": str}
+    # ── Ingestion fields ──────────────────────────────────────────────────────
+    pdf_paths: list[str] = field(default_factory=list)
+    """Absolute paths to PDF files to ingest."""
 
-    # ── Control / error ────────────────────────────────────────────────────
-    error: Optional[str] = None
+    sector: str = ""
+    """Sector / namespace label for the ingested documents."""
 
-    class Config:
-        arbitrary_types_allowed = True
+    raw_documents: list[dict[str, Any]] = field(default_factory=list)
+    """Raw page-level content dicts from the PDF loader node."""
+
+    document_chunks: list[DocumentChunk] = field(default_factory=list)
+    """Text chunks produced by the chunking node."""
+
+    chunk_embeddings: list[list[float]] = field(default_factory=list)
+    """Dense vectors for each document chunk (parallel to document_chunks)."""
+
+    upserted_count: int = 0
+    """Number of vectors successfully upserted to Pinecone."""
+
+    # ── Shared ────────────────────────────────────────────────────────────────
+    error: str = ""
+    """Non-empty string signals a node-level error; downstream nodes should check."""
+
+    metadata: dict[str, Any] = field(default_factory=dict)
+    """Arbitrary metadata bag for observability / debugging."""
+
+
+def get_state_value(state: RAGState | dict[str, Any], field_name: str, default: Any = None) -> Any:
+    """Read a state field from either a RAGState object or LangGraph's dict output."""
+    if isinstance(state, dict):
+        return state.get(field_name, default)
+    return getattr(state, field_name, default)

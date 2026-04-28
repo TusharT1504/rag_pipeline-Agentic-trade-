@@ -1,25 +1,15 @@
-"""Observability helpers for tracing the RAG pipeline."""
-
 from .langsmith import (
-    add_current_run_metadata,
-    compact_embedding_inputs,
-    compact_embedding_outputs,
-    compact_pages_inputs,
-    compact_pages_outputs,
-    compact_search_inputs,
-    compact_search_outputs,
-    retrieved_chunks_as_documents,
-    traceable,
+    get_langsmith_client,
+    log_node_metadata,
+    traced_function,
+    traced_node,
+    traced_tool,
 )
 
 __all__ = [
-    "add_current_run_metadata",
-    "compact_embedding_inputs",
-    "compact_embedding_outputs",
-    "compact_pages_inputs",
-    "compact_pages_outputs",
-    "compact_search_inputs",
-    "compact_search_outputs",
-    "retrieved_chunks_as_documents",
-    "traceable",
+    "traced_node",
+    "traced_tool",
+    "traced_function",
+    "log_node_metadata",
+    "get_langsmith_client",
 ]

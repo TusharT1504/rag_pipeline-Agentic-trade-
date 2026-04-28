@@ -1,110 +1,126 @@
-"""graph/rag_graph.py
+"""
+RAG LangGraph — Conditional graph supporting ingestion and retrieval modes.
 
-Builds and compiles the LangGraph StateGraph that orchestrates the full
-RAG pipeline.
+Graph structure::
 
-                    ┌──────────────────────┐
-                    │  check_embeddings    │
-                    └──────────┬───────────┘
-                     ┌─────────┴─────────┐
-               NO (embed)            YES (retrieve)
-                     │                   │
-          ┌──────────▼─────────┐         │
-          │     load_pdfs      │         │
-          └──────────┬─────────┘         │
-          ┌──────────▼─────────┐         │
-          │  chunk_documents   │         │
-          └──────────┬─────────┘         │
-          ┌──────────▼─────────┐         │
-          │   embed_chunks     │         │
-          └──────────┬─────────┘         │
-          ┌──────────▼─────────┐         │
-          │   store_vectors    │         │
-          └──────────┬─────────┘         │
-                     └─────────┬─────────┘
-                     ┌─────────▼─────────┐
-                     │  retrieve_chunks  │
-                     └─────────┬─────────┘
-                     ┌─────────▼─────────┐
-                     │   analyze_tools   │
-                     └─────────┬─────────┘
-                     ┌─────────▼─────────┐
-                     │  generate_answer  │
-                     └─────────┬─────────┘
-                               END
+    START
+      │
+      ▼
+    router ──── ingest_flag == True ────► pdf_loader ► chunking ► embedding ► vector_store ► END
+      │
+      └── ingest_flag == False (default) ► retrieval ► answer_generation ► END
+
+The ``router`` node is a lightweight pass-through that sets state.mode and
+returns the routing key consumed by ``add_conditional_edges``.
 """
 
 from __future__ import annotations
 
-from langgraph.graph import StateGraph, END
+import logging
+
+from langgraph.graph import StateGraph, END, START
 
 from graph.state import RAGState
+from observability.langsmith import traced_function
 from graph.nodes import (
-    check_embeddings_node,
-    load_pdfs_node,
-    chunk_documents_node,
-    embed_chunks_node,
-    store_vectors_node,
-    retrieve_chunks_node,
-    analyze_tools_node,
-    generate_answer_node,
+    pdf_loader_node,
+    chunking_node,
+    embedding_node,
+    vector_store_node,
+    retrieval_node,
+    answer_generation_node,
 )
 
-
-def _route_after_check(state: RAGState) -> str:
-    """Conditional edge: go to embedding pipeline or directly to retrieval."""
-    if state.error:
-        return END  # type: ignore[return-value]
-    return "retrieve_chunks" if state.embeddings_exist else "load_pdfs"
+logger = logging.getLogger(__name__)
 
 
-def _check_error(state: RAGState) -> str:
-    """Generic error guard used on non-branching edges."""
-    return END if state.error else "continue"  # type: ignore[return-value]
+# ── Router ────────────────────────────────────────────────────────────────────
 
 
+@traced_function("router_node", metadata={"component": "graph"})
+def router_node(state: RAGState) -> RAGState:
+    """
+    Routing node: set state.mode based on state.ingest_flag.
+    Returns state unchanged (routing happens via conditional edge function).
+    """
+    state.mode = "ingestion" if state.ingest_flag else "retrieval"
+    logger.info("[router_node] Mode selected: %s", state.mode)
+    return state
+
+
+def _route(state: RAGState) -> str:
+    """
+    Conditional edge function consumed by LangGraph.
+    Returns the edge key ("ingestion" or "retrieval").
+    """
+    return "ingestion" if state.ingest_flag else "retrieval"
+
+
+# ── Graph builder ─────────────────────────────────────────────────────────────
+
+
+@traced_function("build_rag_graph", metadata={"component": "graph"})
 def build_rag_graph() -> StateGraph:
-    """Construct and compile the RAG LangGraph."""
+    """
+    Build and compile the conditional RAG LangGraph.
 
+    Returns:
+        A compiled ``StateGraph`` ready for ``.invoke()`` or ``.ainvoke()``.
+    """
+    # Use RAGState as the graph's state schema.
+    # LangGraph requires the state class or a TypedDict; we pass RAGState
+    # directly and use its dataclass fields as the shared state contract.
     graph = StateGraph(RAGState)
 
-    # ── Register nodes ──────────────────────────────────────────────────────
-    graph.add_node("check_embeddings", check_embeddings_node)
-    graph.add_node("load_pdfs", load_pdfs_node)
-    graph.add_node("chunk_documents", chunk_documents_node)
-    graph.add_node("embed_chunks", embed_chunks_node)
-    graph.add_node("store_vectors", store_vectors_node)
-    graph.add_node("retrieve_chunks", retrieve_chunks_node)
-    graph.add_node("analyze_tools", analyze_tools_node)
-    graph.add_node("generate_answer", generate_answer_node)
+    # ── Register nodes ────────────────────────────────────────────────────────
+    graph.add_node("router", router_node)
 
-    # ── Entry point ─────────────────────────────────────────────────────────
-    graph.set_entry_point("check_embeddings")
+    # Ingestion pipeline
+    graph.add_node("pdf_loader", pdf_loader_node)
+    graph.add_node("chunking", chunking_node)
+    graph.add_node("embedding", embedding_node)
+    graph.add_node("vector_store", vector_store_node)
 
-    # ── Conditional branch after embedding check ────────────────────────────
+    # Retrieval pipeline: fetch namespace contents directly; no query embedding.
+    graph.add_node("retrieval", retrieval_node)
+    graph.add_node("answer_generation", answer_generation_node)
+
+    # ── Edges ─────────────────────────────────────────────────────────────────
+    graph.add_edge(START, "router")
+
+    # Conditional branch off the router
     graph.add_conditional_edges(
-        "check_embeddings",
-        _route_after_check,
+        "router",
+        _route,
         {
-            "load_pdfs": "load_pdfs",
-            "retrieve_chunks": "retrieve_chunks",
-            END: END,
+            "ingestion": "pdf_loader",
+            "retrieval": "retrieval",
         },
     )
 
-    # ── Embedding pipeline (linear) ─────────────────────────────────────────
-    graph.add_edge("load_pdfs", "chunk_documents")
-    graph.add_edge("chunk_documents", "embed_chunks")
-    graph.add_edge("embed_chunks", "store_vectors")
-    graph.add_edge("store_vectors", "retrieve_chunks")
+    # Ingestion pipeline chain
+    graph.add_edge("pdf_loader", "chunking")
+    graph.add_edge("chunking", "embedding")
+    graph.add_edge("embedding", "vector_store")
+    graph.add_edge("vector_store", END)
 
-    # ── Retrieval → analysis → generation → end ─────────────────────────────
-    graph.add_edge("retrieve_chunks", "analyze_tools")
-    graph.add_edge("analyze_tools", "generate_answer")
-    graph.add_edge("generate_answer", END)
+    # Retrieval pipeline chain
+    graph.add_edge("retrieval", "answer_generation")
+    graph.add_edge("answer_generation", END)
 
-    return graph.compile()
+    compiled = graph.compile()
+    logger.info("RAG graph compiled successfully.")
+    return compiled
 
 
-# Singleton compiled graph
-rag_graph = build_rag_graph()
+# Module-level compiled graph (lazy singleton pattern via module import)
+_compiled_graph = None
+
+
+@traced_function("get_rag_graph", metadata={"component": "graph"})
+def get_rag_graph():
+    """Return the cached compiled RAG graph (built once per process)."""
+    global _compiled_graph
+    if _compiled_graph is None:
+        _compiled_graph = build_rag_graph()
+    return _compiled_graph

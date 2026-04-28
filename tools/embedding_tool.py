@@ -1,119 +1,65 @@
-"""tools/embedding_tool.py
+"""
+Embedding Tool.
+Used for:
+  - Query embedding (ALWAYS, in retrieval mode)
+  - Document embedding (ONLY in ingestion mode)
 
-Single entry-point for all embedding providers.
-Controlled by EMBEDDING_PROVIDER in your .env:
-
-    EMBEDDING_PROVIDER=google                → Google gemini-embedding-004 (free, 768-dim)
-    EMBEDDING_PROVIDER=sentence_transformers → Local SentenceTransformer (free, no API)
+This module NEVER writes to Pinecone — that responsibility belongs
+exclusively to vector_store_tool.py.
 """
 
 from __future__ import annotations
-import logging
-import time
-from typing import Iterator
 
-from config import settings
-from observability import compact_embedding_inputs, compact_embedding_outputs, traceable
-from tools.st_model import get_model
+import logging
+
+from graph.state import DocumentChunk
+from observability.langsmith import traced_tool
+from tools.st_model import embed_query as _embed_query, embed_texts
 
 logger = logging.getLogger(__name__)
 
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
-
-def _batched(lst: list, size: int) -> Iterator[list]:
-    for i in range(0, len(lst), size):
-        yield lst[i : i + size]
-
-
-# ── Provider implementations ─────────────────────────────────────────────────
-
-def _embed_google(chunks: list[dict], batch_size: int = 50) -> list[dict]:
-    from google import genai
-    from google.genai import types
-
-    client = genai.Client(api_key=settings.GOOGLE_API_KEY)
-    model  = settings.EMBEDDING_MODEL   # e.g. "gemini-embedding-004"
-    total  = len(chunks)
-    logger.info("Google embedding: %d chunks with '%s' ...", total, model)
-
-    for batch_num, batch in enumerate(_batched(chunks, batch_size), start=1):
-        texts = [c["text"] for c in batch]
-        while True:
-            try:
-                result = client.models.embed_content(
-                    model=model,
-                    contents=texts,
-                    config=types.EmbedContentConfig(task_type="RETRIEVAL_DOCUMENT"),
-                )
-                embeddings = [e.values for e in result.embeddings]
-                break
-            except Exception as exc:
-                if "quota" in str(exc).lower() or "rate" in str(exc).lower():
-                    logger.warning("Google rate limit - sleeping 30 s ...")
-                    time.sleep(30)
-                else:
-                    raise
-        for chunk, emb in zip(batch, embeddings):
-            chunk["embedding"] = emb
-        logger.debug("Batch %d/%d done.", batch_num, -(-total // batch_size))
-
-    logger.info("Google embedding complete.")
-    return chunks
-
-
-def _embed_sentence_transformers(chunks: list[dict], batch_size: int = 64) -> list[dict]:
-    model = get_model()
-    total = len(chunks)
-    logger.info("ST embedding: %d chunks ...", total)
-
-    texts      = [c["text"] for c in chunks]
-    embeddings = model.encode(
-        texts,
-        batch_size=batch_size,
-        show_progress_bar=total > 50,
-        convert_to_numpy=True,
-    )
-    for chunk, emb in zip(chunks, embeddings):
-        chunk["embedding"] = emb.tolist()
-
-    logger.info("SentenceTransformer embedding complete.")
-    return chunks
-
-
-# ── Public entry point ────────────────────────────────────────────────────────
-
-@traceable(
-    run_type="embedding",
-    name="Embed Chunks",
-    metadata={
-        "provider": settings.EMBEDDING_PROVIDER,
-        "ls_model_name": settings.EMBEDDING_MODEL,
-    },
-    process_inputs=compact_embedding_inputs,
-    process_outputs=compact_embedding_outputs,
-)
-def embedding_tool(chunks: list[dict]) -> list[dict]:
+@traced_tool("embed_query", metadata={"pipeline": "retrieval", "stage": "embedding"})
+def embed_query(query: str) -> list[float]:
     """
-    Embed all chunks using the provider set in EMBEDDING_PROVIDER.
+    Produce a single embedding vector for a user query.
 
-    Parameters
-    ----------
-    chunks : list[dict]   - output of chunking_tool
-                            each item must have a "text" key
+    Args:
+        query: Natural-language query string.
 
-    Returns
-    -------
-    list[dict]  - same dicts with "embedding": list[float] added in-place
+    Returns:
+        Dense float vector of dimension = embedding model dimension.
     """
-    provider = settings.EMBEDDING_PROVIDER.lower()
+    logger.debug("Embedding query (len=%d)", len(query))
+    vector = _embed_query(query)
+    logger.debug("Query embedded | vector_dim=%d", len(vector))
+    return vector
 
-    if provider == "google":
-        return _embed_google(chunks)
-    elif provider == "sentence_transformers":
-        return _embed_sentence_transformers(chunks)
-    else:
-        raise ValueError(
-            f"Unknown EMBEDDING_PROVIDER: '{provider}'. "
-            "Choose from: google | sentence_transformers"
-        )
+
+@traced_tool("embed_document_chunks", metadata={"pipeline": "ingestion", "stage": "embedding"})
+def embed_document_chunks(
+    chunks: list[DocumentChunk],
+    batch_size: int = 64,
+) -> list[list[float]]:
+    """
+    Embed a list of ``DocumentChunk`` objects.
+
+    This function is ONLY called during ingestion mode.
+    Returns a list of vectors in the same order as *chunks*.
+
+    Args:
+        chunks: Chunks produced by the chunking stage.
+        batch_size: SentenceTransformer encoding batch size.
+
+    Returns:
+        List of embedding vectors (parallel to *chunks*).
+    """
+    if not chunks:
+        logger.warning("embed_document_chunks called with empty chunk list.")
+        return []
+
+    texts = [chunk.text for chunk in chunks]
+    logger.info("Embedding %d document chunks (batch_size=%d)…", len(texts), batch_size)
+    vectors = embed_texts(texts, batch_size=batch_size)
+    logger.info("Document chunks embedded | count=%d", len(vectors))
+    return vectors

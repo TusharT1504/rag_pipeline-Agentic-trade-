@@ -1,117 +1,95 @@
-"""tools/chunking_tool.py
-
-Splits raw page-text into overlapping semantic chunks and attaches rich
-metadata so every chunk is independently traceable back to its source.
+"""
+Chunking Tool — Ingestion pipeline, Stage 2.
+Splits page-level text into overlapping chunks suitable for embedding.
 """
 
 from __future__ import annotations
-import re
-import logging
-from datetime import datetime, timezone
 
-from config import settings
-from observability import (
-    compact_embedding_outputs,
-    compact_pages_inputs,
-    traceable,
-)
+import logging
+import uuid
+from typing import Any
+
+from config.settings import get_settings
+from graph.state import DocumentChunk
+from observability.langsmith import traced_tool
 
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Heuristic section detector
-# ---------------------------------------------------------------------------
-_SECTION_PATTERNS = [
-    re.compile(r"^\s{0,4}(\d+[\.\d]*)\s+([A-Z][^\n]{3,60})\s*$", re.MULTILINE),
-    re.compile(r"^\s{0,4}([A-Z][A-Z\s]{4,50})\s*$", re.MULTILINE),
-]
+settings = get_settings()
 
 
-def _detect_section(text: str) -> str:
-    """Return the first plausible section heading found in *text*, or 'General'."""
-    for pattern in _SECTION_PATTERNS:
-        m = pattern.search(text)
-        if m:
-            return m.group(0).strip()[:80]
-    return "General"
-
-
-# ---------------------------------------------------------------------------
-# Sliding-window chunker (token-aware via character proxy)
-# ---------------------------------------------------------------------------
-
-@traceable(
-    run_type="tool",
-    name="Chunk Documents",
-    process_inputs=compact_pages_inputs,
-    process_outputs=compact_embedding_outputs,
-)
-def chunking_tool(pages: list[dict]) -> list[dict]:
+def _split_text(text: str, chunk_size: int, chunk_overlap: int) -> list[str]:
     """
-    Parameters
-    ----------
-    pages : list[dict]
-        Output of pdf_loader_tool — each item has
-        ``document_name``, ``page_number``, ``text``.
+    Split *text* into overlapping windows of *chunk_size* characters.
 
-    Returns
-    -------
-    list[dict]
-        Each item:
-        {
-            "id":       "<doc_stem>_page<N>_chunk<M>",
-            "text":     str,
-            "metadata": {
-                "document_name", "page_number", "section",
-                "chunk_index", "source", "created_at"
-            }
-        }
+    Args:
+        text: Raw text to split.
+        chunk_size: Maximum character length of each chunk.
+        chunk_overlap: Number of characters shared between consecutive chunks.
+
+    Returns:
+        List of text chunks.
     """
-    chunk_size = settings.CHUNK_SIZE        # chars (approx 1 token ≈ 4 chars)
-    chunk_overlap = settings.CHUNK_OVERLAP
+    if chunk_overlap >= chunk_size:
+        raise ValueError("chunk_overlap must be smaller than chunk_size")
 
-    chunks: list[dict] = []
-    created_at = datetime.now(timezone.utc).isoformat()
+    chunks: list[str] = []
+    start = 0
+    while start < len(text):
+        end = start + chunk_size
+        chunk = text[start:end].strip()
+        if chunk:
+            chunks.append(chunk)
+        if end >= len(text):
+            break
+        start = end - chunk_overlap  # slide with overlap
+    return chunks
 
+
+@traced_tool("chunk_pages", metadata={"pipeline": "ingestion", "stage": "chunking"})
+def chunk_pages(
+    pages: list[dict[str, Any]],
+    chunk_size: int | None = None,
+    chunk_overlap: int | None = None,
+) -> list[DocumentChunk]:
+    """
+    Convert page-level dicts into ``DocumentChunk`` objects.
+
+    Args:
+        pages: Output of ``pdf_loader_tool.load_pdfs``.
+        chunk_size: Override settings value if provided.
+        chunk_overlap: Override settings value if provided.
+
+    Returns:
+        Flat list of ``DocumentChunk`` objects ready for embedding.
+    """
+    cs = chunk_size or settings.chunk_size
+    co = chunk_overlap or settings.chunk_overlap
+
+    chunks: list[DocumentChunk] = []
     for page in pages:
-        doc_name: str = page["document_name"]
-        page_num: int = page["page_number"]
-        text: str = page["text"]
-
-        # derive a short source tag from the filename
-        source_tag = doc_name.rsplit(".", 1)[0]   # strip ".pdf"
-        section = _detect_section(text)
-
-        # sliding window over the page text
-        start = 0
-        chunk_index = 0
-        while start < len(text):
-            end = start + chunk_size
-            chunk_text = text[start:end].strip()
-
-            if chunk_text:
-                chunk_id = f"{source_tag}_page{page_num}_chunk{chunk_index}"
-                chunks.append(
-                    {
-                        "id": chunk_id,
-                        "text": chunk_text,
-                        "metadata": {
-                            "document_name": doc_name,
-                            "page_number": page_num,
-                            "section": section,
-                            "chunk_index": chunk_index,
-                            "source": source_tag,
-                            "created_at": created_at,
-                        },
-                    }
+        text = page["text"]
+        sub_chunks = _split_text(text, cs, co)
+        for sub_idx, sub_text in enumerate(sub_chunks):
+            chunk_id = str(uuid.uuid4())
+            chunks.append(
+                DocumentChunk(
+                    chunk_id=chunk_id,
+                    text=sub_text,
+                    sector=page["sector"],
+                    source_file=page["source_file"],
+                    page_number=page["page_number"],
+                    metadata={
+                        "sub_chunk_index": sub_idx,
+                        "char_length": len(sub_text),
+                    },
                 )
-                chunk_index += 1
-
-            if end >= len(text):
-                break
-            start = end - chunk_overlap   # overlap for context continuity
+            )
 
     logger.info(
-        "Chunking complete: %d chunks from %d pages", len(chunks), len(pages)
+        "Created %d chunks from %d page(s) | chunk_size=%d overlap=%d",
+        len(chunks),
+        len(pages),
+        cs,
+        co,
     )
     return chunks

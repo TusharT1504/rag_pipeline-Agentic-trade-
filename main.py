@@ -1,171 +1,155 @@
-"""main.py — Command-line entry point for the LangGraph RAG system.
-
-Usage
------
-    python main.py "What was the export growth in 2023?"
-    python main.py --top-k 8 "Summarise the key findings in the report."
+"""
+Main Entrypoint.
+Runs the FastAPI server via Uvicorn, or exposes the graph for direct use.
 """
 
 from __future__ import annotations
-from pathlib import Path
-import argparse
-import json
+
 import logging
-import os
 import sys
 
+import uvicorn
 
-def _use_project_venv_for_cli() -> None:
-    """Relaunch the CLI with the project venv when run from system Python."""
-    if __name__ != "__main__" or sys.prefix != sys.base_prefix:
-        return
+from config.settings import get_settings
+from observability.langsmith import traced_function
 
-    venv_python = Path(__file__).resolve().parent / ".venv" / "bin" / "python"
-    if not venv_python.exists():
-        return
-
-    current_python = Path(sys.executable).resolve()
-    target_python = venv_python.resolve()
-    if current_python != target_python:
-        os.execv(str(venv_python), [str(venv_python), *sys.argv])
+settings = get_settings()
 
 
-_use_project_venv_for_cli()
-
-from config import settings
-from graph import RAGState, rag_graph
-from observability import traceable
-
-
-def _configure_third_party_logging() -> None:
-    """Reduce noisy library logs while keeping app-level logs visible."""
-    if not settings.QUIET_THIRD_PARTY_LOGS:
-        return
-
-    # Hide verbose HF/HTTP internals and progress output.
-    os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
-    os.environ.setdefault("TQDM_DISABLE", "1")
-
-    noisy_loggers = (
-        "httpx",
-        "httpcore",
-        "huggingface_hub",
-        "sentence_transformers",
-        "sentence_transformers.SentenceTransformer",
-        "sentence_transformers.base.model",
-        "transformers",
+def configure_logging() -> None:
+    """Set up structured logging for the entire application."""
+    level = getattr(logging, settings.log_level.upper(), logging.INFO)
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S",
+        stream=sys.stdout,
     )
-    for logger_name in noisy_loggers:
-        logging.getLogger(logger_name).setLevel(logging.WARNING)
-
-    try:
-        from transformers.utils import logging as transformers_logging
-
-        transformers_logging.set_verbosity_error()
-    except Exception:
-        # transformers may not be installed for non-ST setups.
-        pass
+    # Quieten noisy third-party loggers
+    for noisy in ("httpx", "httpcore", "urllib3", "sentence_transformers"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
-log_level = getattr(logging, settings.LOG_LEVEL, logging.INFO)
-logging.basicConfig(
-    level=log_level,
-    format="%(asctime)s  %(levelname)-8s  %(name)s - %(message)s",
-    datefmt="%H:%M:%S",
-)
-_configure_third_party_logging()
-logger = logging.getLogger(__name__)
+def run_server() -> None:
+    """Start the Uvicorn server."""
+    configure_logging()
+    logger = logging.getLogger(__name__)
+    logger.info(
+        "Starting RAG API on %s:%d (reload=%s)",
+        settings.api_host,
+        settings.api_port,
+        settings.api_reload,
+    )
+    uvicorn.run(
+        "api:app",
+        host=settings.api_host,
+        port=settings.api_port,
+        reload=settings.api_reload,
+        log_level=settings.log_level.lower(),
+    )
 
 
-def _compact_run_query_outputs(output: dict) -> dict:
-    return {
-        "answer_preview": output.get("answer", "")[:300],
-        "source_count": len(output.get("sources", [])),
-        "confidence": output.get("confidence"),
-        "tool_analysis": output.get("tool_analysis", {}),
-    }
-
-
-@traceable(
-    run_type="chain",
-    name="RAG Query",
-    metadata={"service": "rag-pipeline"},
-    process_outputs=_compact_run_query_outputs,
-)
-def run_query(query: str, top_k: int | None = None) -> dict:
+@traced_function("run_cli_query", metadata={"entrypoint": "cli", "mode": "query"})
+def run_cli_query(query: str, namespaces: list[str] | None = None) -> str:
     """
-    Execute the full RAG graph for a given query.
+    Run a single retrieval query from the CLI (no server required).
 
-    Returns
-    -------
-    dict  —  {"answer": ..., "sources": [...], "confidence": ...}
+    Args:
+        query: Natural-language question.
+        namespaces: Pinecone namespaces to search.
+
+    Returns:
+        The generated answer string.
     """
-    settings.validate()
+    configure_logging()
+    from graph.rag_graph import get_rag_graph
+    from graph.state import RAGState, get_state_value
 
-    initial_state = RAGState(query=query)
-    if top_k:
-        settings.TOP_K = top_k
+    logger = logging.getLogger(__name__)
+    logger.info("CLI query: %s", query)
 
-    logger.info("Starting RAG graph for query: '%s'", query)
-    raw = rag_graph.invoke(initial_state)
+    state = RAGState(
+        ingest_flag=False,
+        query=query,
+        namespaces=namespaces or settings.default_namespaces,
+        top_k=settings.retrieval_top_k,
+    )
+    graph = get_rag_graph()
+    result = graph.invoke(state)
 
-    # LangGraph may return a RAGState object OR a plain dict depending on version
-    if isinstance(raw, dict):
-        error        = raw.get("error")
-        final_answer = raw.get("final_answer")
-        tool_analysis = raw.get("tool_analysis", {})
-    else:
-        error        = raw.error
-        final_answer = raw.final_answer
-        tool_analysis = raw.tool_analysis
-
-    default_result = {
-        "answer": "The information is not available in the provided documents.",
-        "sources": [],
-        "confidence": "low",
-    }
-
+    error = get_state_value(result, "error", "")
     if error:
-        logger.error("Graph error: %s", error)
-        result = default_result.copy()
-        result["answer"] = f"An error occurred: {error}"
+        logger.error("Query failed: %s", error)
+    return get_state_value(result, "answer", "")
+
+
+@traced_function("run_cli_ingest", metadata={"entrypoint": "cli", "mode": "ingest"})
+def run_cli_ingest(pdf_paths: list[str], sector: str) -> int:
+    """
+    Run the ingestion pipeline from the CLI.
+
+    Args:
+        pdf_paths: Paths to PDF files.
+        sector: Pinecone namespace / sector label.
+
+    Returns:
+        Number of vectors upserted.
+    """
+    configure_logging()
+    from graph.rag_graph import get_rag_graph
+    from graph.state import RAGState, get_state_value
+
+    logger = logging.getLogger(__name__)
+    logger.info("CLI ingest: sector=%s files=%s", sector, pdf_paths)
+
+    state = RAGState(
+        ingest_flag=True,
+        pdf_paths=pdf_paths,
+        sector=sector,
+    )
+    graph = get_rag_graph()
+    result = graph.invoke(state)
+
+    error = get_state_value(result, "error", "")
+    upserted_count = get_state_value(result, "upserted_count", 0)
+    if error:
+        logger.error("Ingestion failed: %s", error)
     else:
-        result = final_answer or default_result
-    result["tool_analysis"] = tool_analysis
-    return result
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description="LangGraph RAG system - query your PDFs")
-    parser.add_argument("query", help="Question to answer")
-    parser.add_argument("--top-k", type=int, default=None,
-                        help="Number of chunks to retrieve (overrides settings)")
-    parser.add_argument("--json", action="store_true", help="Print raw JSON output")
-    args = parser.parse_args()
-
-    answer = run_query(args.query, top_k=args.top_k)
-
-    if args.json:
-        print(json.dumps(answer, indent=2, ensure_ascii=False))
-    else:
-        print("\n" + "=" * 60)
-        print(f"ANSWER:\n{answer['answer']}")
-        print(f"\nCONFIDENCE: {answer['confidence'].upper()}")
-        if answer.get("tool_analysis"):
-            analysis = answer["tool_analysis"]
-            scores = analysis.get("score_summary", {})
-            print(
-                "\nTOOL ANALYSIS: "
-                f"{analysis.get('retrieved_count', 0)} chunks, "
-                f"top score={scores.get('top')}, "
-                f"sources={len(analysis.get('source_coverage', {}))}"
-            )
-        if answer["sources"]:
-            print("\nSOURCES:")
-            for s in answer["sources"]:
-                print(f"  - {s.get('document_name')}  p.{s.get('page_number')}  [{s.get('section')}]")
-        print("=" * 60 + "\n")
+        logger.info("Ingested %d vectors into namespace '%s'.", upserted_count, sector)
+    return upserted_count
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="RAG System CLI")
+    sub = parser.add_subparsers(dest="command")
+
+    # serve sub-command
+    sub.add_parser("serve", help="Start the FastAPI server")
+
+    # query sub-command
+    q_parser = sub.add_parser("query", help="Run a single retrieval query")
+    q_parser.add_argument("query", type=str, help="Question to answer")
+    q_parser.add_argument(
+        "--namespaces", nargs="+", default=None, help="Pinecone namespaces"
+    )
+
+    # ingest sub-command
+    i_parser = sub.add_parser("ingest", help="Ingest PDFs into Pinecone")
+    i_parser.add_argument("pdfs", nargs="+", help="PDF file paths")
+    i_parser.add_argument("--sector", required=True, help="Sector / namespace")
+
+    args = parser.parse_args()
+
+    if args.command == "serve" or args.command is None:
+        run_server()
+    elif args.command == "query":
+        answer = run_cli_query(args.query, args.namespaces)
+        print("\n" + "=" * 60)
+        print("ANSWER:")
+        print("=" * 60)
+        print(answer)
+    elif args.command == "ingest":
+        count = run_cli_ingest(args.pdfs, args.sector)
+        print(f"\nUpserted {count} vectors to namespace '{args.sector}'.")
